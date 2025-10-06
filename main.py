@@ -3,8 +3,6 @@ import re
 import time
 import logging
 import json
-import tkinter as tk
-from tkinter import ttk
 from urllib.parse import quote
 import concurrent.futures
 
