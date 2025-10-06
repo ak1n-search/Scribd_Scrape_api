@@ -21,4 +21,5 @@ COPY . .
 # Command to run the application
 # Google Cloud Run will set the PORT environment variable.
 # Uvicorn will listen on 0.0.0.0 and the specified port.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Use gunicorn to run Flask
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]
