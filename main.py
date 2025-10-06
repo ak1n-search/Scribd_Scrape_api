@@ -341,8 +341,10 @@ def run_workflow(query, date_filter):
         else:
             print(f"Scraping content for {len(new_urls_to_scrape)} new documents...")
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                results = list(executor.map(scrape_document_details, new_urls_to_scrape))
+            results = []
+            for url in new_urls_to_scrape:
+                scraped_data = scrape_document_details(url)
+                results.append(scraped_data)
 
             print("✅ Scraping complete. Updating database...")
             for scraped_data in results:
