@@ -42,7 +42,7 @@ app = FastAPI(
 # --- Pydantic Models for API Data Validation ---
 class ScrapeRequest(BaseModel):
     query: str = Field(..., example="financial report 2024", description="The search term for Scribd.")
-    date_filter: str = Field(..., example="ct_lang=0&filters=%7B\"date_uploaded\"%3A\"1week\"%7D",
+    date_filter: str = Field(..., example="ct_lang=0&filters=%7B\"date_uploaded\"%3A\"6month\"%7D",
                              description="The URL-encoded date filter string for the search.")
 
 
@@ -270,32 +270,22 @@ def scrape_document_details(doc_url):
         return None
 
 
-# CHANGED: This function now also updates the 'last_seen' timestamp
 def update_document_in_db(data):
-    """Updates a document's details and sets the 'last_seen' timestamp to the current time."""
     if not data or not data.get('url'):
         logging.warning("Skipping database update due to empty data.")
         return
 
     sql = """
-        UPDATE documents_deneme SET
-            title = %s,
-            description = %s,
-            uploader = %s,
-            contents = %s,
-            last_seen = NOW() 
-        WHERE url = %s;
-    """
-    params = (
-        data.get('title'),
-        data.get('description'),
-        data.get('uploader'),
-        data.get('contents'),
-        data.get('url')
-    )
+          UPDATE documents_deneme \
+          SET title       = %s, \
+              description = %s, \
+              uploader    = %s, \
+              contents    = %s
+          WHERE url = %s; \
+          """
+    params = (data.get('title'), data.get('description'), data.get('uploader'), data.get('contents'), data.get('url'))
     execute_query(sql, params)
     logging.info(f"Successfully updated document in DB: {data.get('url')}")
-
 
 
 def highlight_keywords_in_db(query):
@@ -312,22 +302,28 @@ def highlight_keywords_in_db(query):
     logging.info("Keyword highlighting complete.")
 
 
+# --- Main Workflow Orchestration (Your Original Code) ---
 def run_workflow(query, date_filter):
-    DOCUMENT_PROCESS_LIMIT = 200
+    DOCUMENT_PROCESS_LIMIT = 1  # You can adjust this limit
+
     try:
-        logging.info(f"🚀 Starting process for query: '{query}'")
+        logging.info(f"🚀 Starting process for query: '{query}' with filter '{date_filter}'")
         doc_urls = search_scribd_for_urls(query, date_filter)
         if not doc_urls:
             logging.info(f"⏹️ No document URLs found for '{query}'. Stopping.")
             return
+        logging.info(f"✅ Found {len(doc_urls)} document URLs...")
 
         new_urls_to_scrape = process_and_store_urls(doc_urls, query)
 
         if len(new_urls_to_scrape) > DOCUMENT_PROCESS_LIMIT:
-            logging.warning(f"⚠️ Limiting processing to the first {DOCUMENT_PROCESS_LIMIT} documents.")
+            logging.warning(
+                f"⚠️ Found {len(new_urls_to_scrape)} new documents. Limiting processing to the first {DOCUMENT_PROCESS_LIMIT}.")
             new_urls_to_scrape = new_urls_to_scrape[:DOCUMENT_PROCESS_LIMIT]
 
-        if new_urls_to_scrape:
+        if not new_urls_to_scrape:
+            logging.info("✅ No new content to scrape.")
+        else:
             logging.info(f"Scraping content for {len(new_urls_to_scrape)} new documents...")
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 results = list(executor.map(scrape_document_details, new_urls_to_scrape))
@@ -335,7 +331,7 @@ def run_workflow(query, date_filter):
             logging.info("✅ Scraping complete. Updating database...")
             for scraped_data in results:
                 if scraped_data:
-                    update_document_in_db(scraped_data)  # No longer passes run_id
+                    update_document_in_db(scraped_data)
 
         logging.info("✨ Highlighting keywords in the database...")
         highlight_keywords_in_db(query)
@@ -348,40 +344,32 @@ def run_workflow(query, date_filter):
 
 @app.get("/", summary="Health Check")
 def read_root():
+    """A simple health check endpoint to confirm the API is running."""
     return {"status": "ok", "message": "Welcome to the Scraper API!"}
 
 
-# CHANGED: This endpoint now returns a timestamp and the original query
 @app.post("/scrape", status_code=202, summary="Start Scraping Job")
 def trigger_scraping_job(request: ScrapeRequest, background_tasks: BackgroundTasks):
+def trigger_scraping_job(request: ScrapeRequest, background_tasks: BackgroundTasks):
     """
-    Accepts a search query, starts the scraping process, and returns a timestamp
-    that can be used to retrieve the results of this specific run.
+    Accepts a search query and date filter, then starts the scraping process as a background task.
     """
     if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD]):
         raise HTTPException(status_code=500, detail="Database environment variables are not configured on the server.")
 
-    # Get the current time in UTC, which is crucial for server environments
-    start_time = datetime.datetime.now(datetime.timezone.utc)
-
+    logging.info(f"Received scraping request for query: '{request.query}'")
     background_tasks.add_task(run_workflow, request.query, request.date_filter)
-
-    return {
-        "message": "Scraping job accepted and started in the background.",
-        "query": request.query,
-        "run_started_at": start_time.isoformat()
-    }
+    return {"message": "Scraping job accepted and started in the background."}
 
 
-# NEW: A new endpoint to get results for a run using a timestamp and query
-@app.get("/documents/run", summary="Get Results for a Specific Run")
-def get_run_results(
-        query: str = Query(..., description="The original search query for the run."),
-        started_after: datetime.datetime = Query(...,
-                                                 description="The ISO 8601 timestamp returned when the run was started (e.g., '2025-10-06T10:30:00.123456+00:00').")
+@app.get("/documents", summary="Retrieve Scraped Documents")
+def get_documents(
+        keyword: Optional[str] = Query(None, description="Filter documents by the original search keyword."),
+        limit: int = Query(20, gt=0, le=100, description="The number of documents to return."),
+        offset: int = Query(0, ge=0, description="The starting offset for pagination.")
 ):
     """
-    Retrieves documents that were processed for a specific query after a given start time.
+    Retrieves scraped documents from the database with optional filtering by keyword and pagination.
     """
     conn = get_db_connection(cursor_factory=DictCursor)
     if not conn:
@@ -389,13 +377,17 @@ def get_run_results(
 
     try:
         with conn.cursor() as cur:
-            # Query for documents matching the keyword that were updated *after* the job started.
-            sql_query = "SELECT * FROM documents_deneme WHERE search_keyword = %s AND last_seen >= %s ORDER BY last_seen DESC;"
-            params = (query, started_after)
-            cur.execute(sql_query, params)
+            if keyword:
+                query = "SELECT * FROM documents_deneme WHERE search_keyword ILIKE %s ORDER BY last_seen DESC LIMIT %s OFFSET %s;"
+                params = (f"%{keyword}%", limit, offset)
+            else:
+                query = "SELECT * FROM documents_deneme ORDER BY last_seen DESC LIMIT %s OFFSET %s;"
+                params = (limit, offset)
+
+            cur.execute(query, params)
             results = cur.fetchall()
 
-            # It's better to return an empty list than a 404 if the job is just not finished yet
+            # Convert DictRow objects to plain dicts and format datetimes for JSON compatibility
             json_results = []
             for row in results:
                 row_dict = dict(row)
@@ -406,7 +398,7 @@ def get_run_results(
             return json_results
 
     except Exception as e:
-        logging.error(f"Failed to fetch documents for run: {e}")
+        logging.error(f"Failed to fetch documents: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve documents from the database.")
     finally:
         if conn:
