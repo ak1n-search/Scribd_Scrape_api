@@ -350,12 +350,10 @@ def read_root():
 
 @app.post("/scrape", status_code=202, summary="Start Scraping Job")
 def trigger_scraping_job(request: ScrapeRequest, background_tasks: BackgroundTasks):
-def trigger_scraping_job(request: ScrapeRequest, background_tasks: BackgroundTasks):
-    """
-    Accepts a search query and date filter, then starts the scraping process as a background task.
-    """
+    # This line IS indented, which is correct.
     if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD]):
         raise HTTPException(status_code=500, detail="Database environment variables are not configured on the server.")
+    # ... and so on for the rest of the function
 
     logging.info(f"Received scraping request for query: '{request.query}'")
     background_tasks.add_task(run_workflow, request.query, request.date_filter)
