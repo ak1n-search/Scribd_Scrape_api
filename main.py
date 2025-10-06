@@ -3,19 +3,17 @@ import re
 import time
 import logging
 import json
-import datetime
+import tkinter as tk
+from tkinter import ttk
 from urllib.parse import quote
 import concurrent.futures
-from typing import Optional, List
 
 import requests
 import psycopg2
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from markdownify import markdownify as md
-from psycopg2.extras import execute_batch, DictCursor
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
-from pydantic import BaseModel, Field
+from psycopg2.extras import execute_batch
 
 # --- Configuration and Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,32 +29,16 @@ DB_PORT = os.environ.get("DB_PORT", "5432")
 # --- Use a Session object for performance ---
 session = requests.Session()
 
-# --- FastAPI App Initialization ---
-app = FastAPI(
-    title="Scribd Scraper API",
-    description="An API to trigger a Scribd scraper and retrieve the results from a database.",
-    version="1.0.0"
-)
-
-
-# --- Pydantic Models for API Data Validation ---
-class ScrapeRequest(BaseModel):
-    query: str = Field(..., example="financial report 2024", description="The search term for Scribd.")
-    date_filter: str = Field(..., example="ct_lang=0&filters=%7B\"date_uploaded\"%3A\"6month\"%7D",
-                             description="The URL-encoded date filter string for the search.")
-
 
 # --- Helper Functions ---
-def get_db_connection(cursor_factory=None):
-    """Establishes a connection to the PostgreSQL database."""
+def get_db_connection():
     try:
         conn = psycopg2.connect(
             dbname=DB_NAME,
             user=DB_USER,
             password=DB_PASSWORD,
             host=DB_HOST,
-            port=DB_PORT,
-            cursor_factory=cursor_factory
+            port=DB_PORT
         )
         return conn
     except psycopg2.OperationalError as e:
@@ -65,7 +47,6 @@ def get_db_connection(cursor_factory=None):
 
 
 def execute_query(query, params=None, fetch=None):
-    """Executes a single database query."""
     conn = get_db_connection()
     if not conn:
         return None
@@ -87,7 +68,7 @@ def execute_query(query, params=None, fetch=None):
     return results
 
 
-# --- Text and HTML Processing Functions (Your Original Code) ---
+# --- Text and HTML Processing Functions ---
 
 def parse_jsonp_content(jsonp_content):
     if not jsonp_content or not isinstance(jsonp_content, str):
@@ -143,8 +124,7 @@ def parse_title_desc_uploader(cleaned_markdown):
     return data
 
 
-# --- Core Scraping Workflow Functions (Your Original Code) ---
-
+# --- Core Scraping Workflow Functions ---
 def search_scribd_for_urls(query, date_filter):
     logging.info(f"Starting Scribd search for query: '{query}' with filter: '{date_filter}'")
     document_urls = set()
@@ -152,6 +132,11 @@ def search_scribd_for_urls(query, date_filter):
     for page_num in range(1, 1000):
         try:
             encoded_query = quote(query)
+
+            # Dynamically create the filter part of the URL
+            filter_json = f'{{"date_uploaded":"{date_filter}"}}'
+            encoded_filter = quote(filter_json)
+
             search_url = (
                 f"https://www.scribd.com/search/query?query={encoded_query}"
                 f"&content_type=documents&page={page_num}&verbatim=true"
@@ -183,7 +168,13 @@ def search_scribd_for_urls(query, date_filter):
     return list(document_urls)
 
 
+
+
 def process_and_store_urls(urls, query):
+    """
+    Efficiently stores URLs in the database using a single transaction and batch insert,
+    then fetches the URLs for newly added documents.
+    """
     logging.info(f"Processing {len(urls)} URLs for keyword '{query}'...")
     if not urls:
         return []
@@ -192,41 +183,46 @@ def process_and_store_urls(urls, query):
     new_document_urls = []
 
     try:
+        # 1. Establish a single, persistent connection for all operations.
         conn = get_db_connection()
         with conn.cursor() as cur:
+
+            # 2. Use a highly efficient batch insert instead of a slow loop.
             sql_insert = """
-                         INSERT INTO documents_deneme (url, search_keyword, source, first_seen, last_seen)
-                         VALUES (%s, %s, 'scribd', NOW(), NOW()) ON CONFLICT (url) DO \
-                         UPDATE \
-                             SET last_seen = NOW(); \
-                         """
+                INSERT INTO documents_deneme (url, search_keyword, source, first_seen, last_seen)
+                VALUES (%s, %s, 'scribd', NOW(), NOW())
+                ON CONFLICT (url) DO UPDATE
+                SET last_seen = NOW();
+            """
             data_to_insert = [(url, query) for url in urls]
             execute_batch(cur, sql_insert, data_to_insert)
             logging.info(f"Batch insert of {len(urls)} URLs complete.")
 
+            # 3. Commit the transaction. This makes all the above inserts permanent
+            # and guarantees they are visible to the next query.
             conn.commit()
             logging.info("Transaction committed successfully.")
 
+            # 4. Now we can safely query for the new documents. The sleep calls are gone.
             sql_check_new = """
-                            SELECT url \
-                            FROM documents_deneme
-                            WHERE search_keyword = %s \
-                              AND contents IS NULL; \
-                            """
+                SELECT url FROM documents_deneme
+                WHERE search_keyword = %s AND contents IS NULL;
+            """
             cur.execute(sql_check_new, (query,))
             new_docs_raw = cur.fetchall()
             new_document_urls = [row[0] for row in new_docs_raw] if new_docs_raw else []
+
             logging.info(f"Found {len(new_document_urls)} new documents to scrape.")
 
     except (Exception, psycopg2.DatabaseError) as error:
         logging.error(f"Database transaction failed: {error}")
         if conn:
-            conn.rollback()
+            conn.rollback()  # If anything goes wrong, undo all changes.
     finally:
         if conn:
-            conn.close()
-    return new_document_urls
+            conn.close()  # 5. Always close the connection when done.
 
+    return new_document_urls
 
 def scrape_document_details(doc_url):
     logging.info(f"Scraping document: {doc_url}")
@@ -276,128 +272,127 @@ def update_document_in_db(data):
         return
 
     sql = """
-          UPDATE documents_deneme \
-          SET title       = %s, \
-              description = %s, \
-              uploader    = %s, \
-              contents    = %s
-          WHERE url = %s; \
-          """
-    params = (data.get('title'), data.get('description'), data.get('uploader'), data.get('contents'), data.get('url'))
+        UPDATE documents_deneme SET
+            title = %s,
+            description = %s,
+            uploader = %s,
+            contents = %s
+        WHERE url = %s;
+    """
+    params = (
+        data.get('title'),
+        data.get('description'),
+        data.get('uploader'),
+        data.get('contents'),
+        data.get('url')
+    )
     execute_query(sql, params)
     logging.info(f"Successfully updated document in DB: {data.get('url')}")
 
 
 def highlight_keywords_in_db(query):
+    # 1. Clean the query string by removing surrounding quotes
+    # .strip('"') removes leading and trailing double quotes if they exist.
     highlight_term = query.strip('"')
+
     logging.info(f"Highlighting keyword '{highlight_term}' in the database.")
+
+    # 2. Use the cleaned term for both the regex pattern and the replacement string
+    # Escape the term to handle special characters correctly in the regex
+    # The pattern now searches for the unquoted term
     pattern = f"\\y{re.escape(highlight_term)}\\y"
     replacement = f"<mark>{highlight_term}</mark>"
+
+    # 3. The SQL query remains the same, but it uses the cleaned pattern and replacement
     sql = """
-          UPDATE documents_deneme
-          SET highlighted_contents = REGEXP_REPLACE(contents, %s, %s, 'gi')
-          WHERE search_keyword ILIKE %s; \
-          """
+        UPDATE documents_deneme
+        SET highlighted_contents = REGEXP_REPLACE(contents, %s, %s, 'gi')
+        WHERE search_keyword ILIKE %s;
+    """
+    # The last %s parameter still uses the original, potentially quoted query to target
+    # documents that were scraped under that specific search query.
     execute_query(sql, (pattern, replacement, f"%{query}%"))
     logging.info("Keyword highlighting complete.")
 
 
-# --- Main Workflow Orchestration (Your Original Code) ---
+# --- Main Workflow Orchestration ---
+# --- Main Workflow Orchestration ---
 def run_workflow(query, date_filter):
-    DOCUMENT_PROCESS_LIMIT = 1  # You can adjust this limit
+    # ADD THIS CONSTANT AT THE TOP OF THE FUNCTION OR SCRIPT
+    DOCUMENT_PROCESS_LIMIT = 1
 
     try:
-        logging.info(f"🚀 Starting process for query: '{query}' with filter '{date_filter}'")
+        print(f"🚀 Starting process for query: '{query}' with filter '{date_filter}'")
         doc_urls = search_scribd_for_urls(query, date_filter)
         if not doc_urls:
-            logging.info(f"⏹️ No document URLs found for '{query}'. Stopping.")
+            print(f"⏹️ No document URLs found for '{query}'. Stopping.")
             return
-        logging.info(f"✅ Found {len(doc_urls)} document URLs...")
+        print(f"✅ Found {len(doc_urls)} document URLs...")
 
         new_urls_to_scrape = process_and_store_urls(doc_urls, query)
 
+        # --- NEW LOGIC TO LIMIT DOCUMENT PROCESSING ---
         if len(new_urls_to_scrape) > DOCUMENT_PROCESS_LIMIT:
-            logging.warning(
+            print(
                 f"⚠️ Found {len(new_urls_to_scrape)} new documents. Limiting processing to the first {DOCUMENT_PROCESS_LIMIT}.")
             new_urls_to_scrape = new_urls_to_scrape[:DOCUMENT_PROCESS_LIMIT]
+        # --- END OF NEW LOGIC ---
 
         if not new_urls_to_scrape:
-            logging.info("✅ No new content to scrape.")
+            print("✅ No new content to scrape.")
         else:
-            logging.info(f"Scraping content for {len(new_urls_to_scrape)} new documents...")
+            print(f"Scraping content for {len(new_urls_to_scrape)} new documents...")
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 results = list(executor.map(scrape_document_details, new_urls_to_scrape))
 
-            logging.info("✅ Scraping complete. Updating database...")
+            print("✅ Scraping complete. Updating database...")
             for scraped_data in results:
                 if scraped_data:
                     update_document_in_db(scraped_data)
 
-        logging.info("✨ Highlighting keywords in the database...")
+        print("✨ Highlighting keywords in the database...")
         highlight_keywords_in_db(query)
-        logging.info(f"\n🎉 Process for query '{query}' is complete!")
+        print(f"\n🎉 Process for query '{query}' is complete!")
     except Exception as e:
         logging.error(f"A critical error occurred during the workflow: {e}")
+        print(f"❌ An error occurred: {e}")
 
 
-# --- API Endpoints ---
+from flask import Flask, request, jsonify
 
-@app.get("/", summary="Health Check")
-def read_root():
-    """A simple health check endpoint to confirm the API is running."""
-    return {"status": "ok", "message": "Welcome to the Scraper API!"}
+app = Flask(__name__)
 
-
-@app.post("/scrape", status_code=202, summary="Start Scraping Job")
-def trigger_scraping_job(request: ScrapeRequest, background_tasks: BackgroundTasks):
-    # This line IS indented, which is correct.
-    if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD]):
-        raise HTTPException(status_code=500, detail="Database environment variables are not configured on the server.")
-    # ... and so on for the rest of the function
-
-    logging.info(f"Received scraping request for query: '{request.query}'")
-    background_tasks.add_task(run_workflow, request.query, request.date_filter)
-    return {"message": "Scraping job accepted and started in the background."}
-
-
-@app.get("/documents", summary="Retrieve Scraped Documents")
-def get_documents(
-        keyword: Optional[str] = Query(None, description="Filter documents by the original search keyword."),
-        limit: int = Query(20, gt=0, le=100, description="The number of documents to return."),
-        offset: int = Query(0, ge=0, description="The starting offset for pagination.")
-):
-    """
-    Retrieves scraped documents from the database with optional filtering by keyword and pagination.
-    """
-    conn = get_db_connection(cursor_factory=DictCursor)
-    if not conn:
-        raise HTTPException(status_code=503, detail="Database connection could not be established.")
+@app.route('/scrape', methods=['POST'])
+def scrape_api():
+    data = request.get_json()
+    keyword = data.get('keyword')
+    date_filter = data.get('date_filter')
+    if not keyword or not date_filter:
+        return jsonify({'error': 'Missing keyword or date_filter'}), 400
 
     try:
-        with conn.cursor() as cur:
-            if keyword:
-                query = "SELECT * FROM documents_deneme WHERE search_keyword ILIKE %s ORDER BY last_seen DESC LIMIT %s OFFSET %s;"
-                params = (f"%{keyword}%", limit, offset)
-            else:
-                query = "SELECT * FROM documents_deneme ORDER BY last_seen DESC LIMIT %s OFFSET %s;"
-                params = (limit, offset)
-
-            cur.execute(query, params)
-            results = cur.fetchall()
-
-            # Convert DictRow objects to plain dicts and format datetimes for JSON compatibility
-            json_results = []
-            for row in results:
-                row_dict = dict(row)
-                for key, value in row_dict.items():
-                    if isinstance(value, datetime.datetime):
-                        row_dict[key] = value.isoformat()
-                json_results.append(row_dict)
-            return json_results
-
+        run_workflow(keyword, date_filter)
+        # Fetch processed documents from DB (example: those with non-null contents)
+        sql = "SELECT url, title, description, uploader, contents, highlighted_contents FROM documents_deneme WHERE search_keyword = %s AND contents IS NOT NULL;"
+        results = execute_query(sql, (keyword,), fetch="all")
+        docs = [
+            {
+                "url": r[0],
+                "title": r[1],
+                "description": r[2],
+                "uploader": r[3],
+                "contents": r[4],
+                "highlighted_contents": r[5]
+            }
+            for r in results or []
+        ]
+        return jsonify({'documents': docs})
     except Exception as e:
-        logging.error(f"Failed to fetch documents: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve documents from the database.")
-    finally:
-        if conn:
-            conn.close()
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == "__main__":
+    if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD]):
+        logging.error("One or more required database environment variables are not set. Please check your .env file.")
+    else:
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
